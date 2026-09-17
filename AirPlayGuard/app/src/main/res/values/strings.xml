@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AirPlay 待机管家</string>
+    <string name="admin_description">允许本应用在闲置超时后关闭电视屏幕。除熄屏外不会使用任何其他管理权限。</string>
+    <string name="channel_name">待机守护</string>
+</resources>

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android TV has no pointer: the only way a user knows which row the D-pad is on
+     is this drawable. Focused state is deliberately loud. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#4DA3FF" />
+            <corners android:radius="10dp" />
+            <stroke android:width="3dp" android:color="#FFFFFF" />
+        </shape>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#2E7BD6" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#1C2637" />
+            <corners android:radius="10dp" />
+            <stroke android:width="1dp" android:color="#2E3B52" />
+        </shape>
+    </item>
+</selector>

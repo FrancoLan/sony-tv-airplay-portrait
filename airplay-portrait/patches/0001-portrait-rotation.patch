@@ -1,0 +1,297 @@
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt b/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
+index f4a643e..322b280 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
+@@ -32,6 +32,9 @@ object Prefs {
+     const val FORCE_SW_ALAC = "force_sw_alac"; const val DEF_FORCE_SW_ALAC = true
+     const val AAC_ENABLED = "aac_enabled"; const val DEF_AAC_ENABLED = true
+     const val RESOLUTION = "resolution"; const val DEF_RESOLUTION = AUTO
++    // clockwise degrees the mirrored picture is rotated by before it hits the panel,
++    // for TVs physically mounted at 90 deg. 0/90/180/270.
++    const val ROTATION = "rotation"; const val DEF_ROTATION = 0
+     const val MAX_FPS = "max_fps"; const val DEF_MAX_FPS = 60
+     const val OVERSCANNED = "overscanned"; const val DEF_OVERSCANNED = false
+     const val REQUIRE_PIN = "require_pin"; const val DEF_REQUIRE_PIN = false
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt
+index d9e1ca4..8f44ff5 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoPipeline.kt
+@@ -30,8 +30,13 @@ class VideoPipeline {
+     private var aPos = 0
+     private var aTex = 0
+     private var uTexMatrix = 0
++    private var uPosMatrix = 0
+     private val texMatrix = FloatArray(16)
++    private val posMatrix = FloatArray(16)
+     private var hasFrame = false
++    // clockwise rotation applied to the quad; 0/90/180/270
++    private var rotationDeg = 0
++    private var repaint = false
+ 
+     private var surfaceTexture: SurfaceTexture? = null
+     var inputSurface: Surface? = null; private set
+@@ -55,6 +60,15 @@ class VideoPipeline {
+         lock.notifyAll()
+     }
+ 
++    // panel is mounted rotated: spin the quad, don't touch the decoder
++    fun setRotation(deg: Int) = synchronized(lock) {
++        val d = (((deg % 360) + 360) % 360) / 90 * 90
++        if (d == rotationDeg) return@synchronized
++        rotationDeg = d
++        repaint = true
++        lock.notifyAll()
++    }
++
+     fun setVideoSize(w: Int, h: Int) {
+         videoW = w
+         videoH = h
+@@ -81,6 +95,7 @@ class VideoPipeline {
+             return
+         }
+         Matrix.setIdentityM(texMatrix, 0)
++        Matrix.setIdentityM(posMatrix, 0)
+         synchronized(lock) {
+             inputSurface = Surface(surfaceTexture)
+             lock.notifyAll()
+@@ -89,8 +104,9 @@ class VideoPipeline {
+             var newDisplay: Surface? = null
+             var displayChanged = false
+             var doFrame = false
++            var doRepaint = false
+             synchronized(lock) {
+-                while (running && !frameAvailable && !displayDirty) lock.wait()
++                while (running && !frameAvailable && !displayDirty && !repaint) lock.wait()
+                 if (running && displayDirty) {
+                     newDisplay = pendingDisplay
+                     displayChanged = true
+@@ -100,10 +116,19 @@ class VideoPipeline {
+                     frameAvailable = false
+                     doFrame = true
+                 }
++                if (running && repaint) {
++                    repaint = false
++                    doRepaint = true
++                }
+             }
+             if (!running) break
+             if (displayChanged) _bindDisplay(newDisplay)
+             if (doFrame) _consumeAndDraw()
++            // rotation changed mid-session and the source is idle: redraw the last frame
++            else if (doRepaint && hasFrame && window != EGL14.EGL_NO_SURFACE) {
++                egl?.makeCurrent(window)
++                _render()
++            }
+         }
+         _releaseGl()
+     }
+@@ -145,13 +170,34 @@ class VideoPipeline {
+         _render()
+     }
+ 
++    // maps the video into the window: rotate for a sideways-mounted panel, then
++    // letterbox so the rotated picture keeps its aspect ratio
++    private fun _updatePosMatrix() {
++        Matrix.setIdentityM(posMatrix, 0)
++        val vw = videoW
++        val vh = videoH
++        if (vw <= 0 || vh <= 0 || winW <= 0 || winH <= 0) return
++        val swap = rotationDeg == 90 || rotationDeg == 270
++        val contentAspect = if (swap) vh.toFloat() / vw else vw.toFloat() / vh
++        val windowAspect = winW.toFloat() / winH
++        var sx = 1f
++        var sy = 1f
++        if (contentAspect > windowAspect) sy = windowAspect / contentAspect
++        else sx = contentAspect / windowAspect
++        // column-vector order: scale is applied after the rotation
++        Matrix.scaleM(posMatrix, 0, sx, sy, 1f)
++        if (rotationDeg != 0) Matrix.rotateM(posMatrix, 0, rotationDeg.toFloat(), 0f, 0f, 1f)
++    }
++
+     private fun _render() {
++        _updatePosMatrix()
+         GLES20.glViewport(0, 0, winW, winH)
+         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+         GLES20.glUseProgram(program)
+         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
+         GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrix, 0)
++        GLES20.glUniformMatrix4fv(uPosMatrix, 1, false, posMatrix, 0)
+         GLES20.glEnableVertexAttribArray(aPos)
+         GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, POS)
+         GLES20.glEnableVertexAttribArray(aTex)
+@@ -167,6 +213,7 @@ class VideoPipeline {
+         aPos = GLES20.glGetAttribLocation(program, "aPos")
+         aTex = GLES20.glGetAttribLocation(program, "aTex")
+         uTexMatrix = GLES20.glGetUniformLocation(program, "uTexMatrix")
++        uPosMatrix = GLES20.glGetUniformLocation(program, "uPosMatrix")
+         val tex = IntArray(1)
+         GLES20.glGenTextures(1, tex, 0)
+         oesTex = tex[0]
+@@ -232,9 +279,10 @@ class VideoPipeline {
+             "attribute vec2 aPos;\n" +
+             "attribute vec2 aTex;\n" +
+             "uniform mat4 uTexMatrix;\n" +
++            "uniform mat4 uPosMatrix;\n" +
+             "varying vec2 vTex;\n" +
+             "void main() {\n" +
+-            "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
++            "  gl_Position = uPosMatrix * vec4(aPos, 0.0, 1.0);\n" +
+             "  vTex = (uTexMatrix * vec4(aTex, 0.0, 1.0)).xy;\n" +
+             "}\n"
+ 
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
+index 1641aa5..5ca262b 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
+@@ -47,6 +47,13 @@ class VideoRenderer(ctx: Context) {
+     private var _ptsBaseUs = Long.MIN_VALUE
+     private var _wallBaseNs = 0L
+ 
++    // clockwise degrees the picture is rotated by; for a physically rotated panel
++    var rotationDegrees: Int = 0
++        set(value) {
++            field = value
++            pipeline.setRotation(value)
++        }
++
+     fun setResolution(w: Int, h: Int) {
+         videoWidth = w
+         videoHeight = h
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt b/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
+index 9390300..de080c3 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
+@@ -390,6 +390,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         videoRenderer.benchmarkLog = prefs.getBoolean(Prefs.BENCHMARK_LOG, Prefs.DEF_BENCHMARK_LOG)
+         videoRenderer.benchmarkLogCallback = { msg -> logCallback?.invoke(msg) }
+         videoRenderer.scheduledOutputBufferRelease = prefs.getBoolean(Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE, Prefs.DEF_SCHEDULED_OUTPUT_BUFFER_RELEASE)
++        videoRenderer.rotationDegrees = prefs.getInt(Prefs.ROTATION, Prefs.DEF_ROTATION)
+         NativeBridge.nativeSetH265Enabled(nativeHandle, h265)
+         NativeBridge.nativeSetCodecs(nativeHandle, alac, aac)
+         val advertiseVideo = prefs.getBoolean(Prefs.ADVERTISE_VIDEO, Prefs.DEF_ADVERTISE_VIDEO)
+@@ -807,6 +808,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+     }
+ 
+     override fun onMirrorRunning(running: Boolean) {
++        _broadcastSession(running)
+         if (running) videoRenderer.startSession() else {
+             videoRenderer.stopSession()
+             _mirroringActive.value = false
+@@ -814,6 +816,18 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         _setAudioOnly(!running)
+     }
+ 
++    // lets a companion app (screen wake / idle standby) react to a session without
++    // having to guess from network traffic. Harmless if nothing is listening.
++    private fun _broadcastSession(active: Boolean) {
++        runCatching {
++            sendBroadcast(
++                Intent(SESSION_BROADCAST)
++                    .putExtra("active", active)
++                    .setPackage(SESSION_BROADCAST_TARGET)
++            )
++        }
++    }
++
+     private fun _setAudioOnly(audioOnly: Boolean) {
+         val prev = _audioOnly.value
+         _audioOnly.value = audioOnly
+@@ -1109,6 +1123,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+         private const val VOL_SYNC_MAX_STEPS = 32
+         private const val VOL_SYNC_TIMEOUT_MS = 800L
+         private const val CHANNEL_ID = "airplay_service"
++        // consumed by the AirPlayGuard companion app (screen wake / idle standby)
++        const val SESSION_BROADCAST = "dev.frank.airplayguard.SESSION"
++        const val SESSION_BROADCAST_TARGET = "dev.frank.airplayguard"
+         private const val NOTIFICATION_ID = 1
+         const val ACTION_PLAY_PAUSE = "io.github.jqssun.airplay.PLAY_PAUSE"
+         const val ACTION_NEXT = "io.github.jqssun.airplay.NEXT"
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt b/app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt
+index 81e662d..637e66b 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt
+@@ -103,10 +103,14 @@ fun MainScreen(
+     // don't use movableContentOf: moving AndroidView across subcomposition boundaries makes it crash on reparent
+     val video: @Composable () -> Unit = {
+         val aspect by viewModel.videoAspect.collectAsState()
++        val rotation by viewModel.rotation.collectAsState()
++        // a quarter turn swaps what the viewer sees, so the surface must be sized to
++        // the rotated shape or the GL blit gets letterboxed inside a letterbox
++        val shownAspect = if (rotation % 180 != 0) 1f / aspect else aspect
+         VideoSurfaceView(
+             onSurfaceAvailable = onSurfaceAvailable,
+             onSurfaceDestroyed = onSurfaceDestroyed,
+-            aspectRatio = aspect
++            aspectRatio = shownAspect
+         )
+     }
+ 
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt b/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt
+index 554fe10..ad9852b 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt
+@@ -41,6 +41,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
+     val alacEnabled by viewModel.alacEnabled.collectAsState()
+     val aacEnabled by viewModel.aacEnabled.collectAsState()
+     val resolution by viewModel.resolution.collectAsState()
++    val rotation by viewModel.rotation.collectAsState()
+     val idlePreview by viewModel.idlePreview.collectAsState()
+     val autoFullscreen by viewModel.autoFullscreen.collectAsState()
+     val keepScreenOn by viewModel.keepScreenOn.collectAsState()
+@@ -169,6 +170,17 @@ fun SettingsScreen(viewModel: MainViewModel) {
+             onValueChange = { viewModel.setResolution(it) }
+         )
+ 
++        SettingChipField(
++            title = "Picture rotation",
++            description = "Rotate the mirrored picture for a TV mounted sideways. " +
++                "Pair with Resolution = portrait so the sender streams portrait natively.",
++            value = rotation.toString(),
++            presets = listOf("0" to "0\u00b0", "90" to "90\u00b0", "180" to "180\u00b0", "270" to "270\u00b0"),
++            placeholder = "0",
++            keyboardType = KeyboardType.Number,
++            onValueChange = { it.toIntOrNull()?.let { v -> viewModel.setRotation(v) } }
++        )
++
+         SettingChipField(
+             title = stringResource(R.string.setting_max_fps),
+             description = stringResource(R.string.setting_max_fps_desc),
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/ui/theme/Theme.kt b/app/src/main/kotlin/io/github/jqssun/airplay/ui/theme/Theme.kt
+index 4f5f226..9cb8849 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/ui/theme/Theme.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/ui/theme/Theme.kt
+@@ -12,7 +12,10 @@ import androidx.compose.ui.platform.LocalContext
+ 
+ @Composable
+ fun AirPlayTheme(
+-    darkTheme: Boolean = isSystemInDarkTheme(),
++    // Forced dark rather than isSystemInDarkTheme(): this Sony firmware has no night
++    // mode at all (`cmd uimode night yes` is a no-op), so following the system leaves a
++    // bright white idle screen burning on the panel between sessions.
++    darkTheme: Boolean = true,
+     content: @Composable () -> Unit
+ ) {
+     val colorScheme = when {
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/viewmodel/MainViewModel.kt b/app/src/main/kotlin/io/github/jqssun/airplay/viewmodel/MainViewModel.kt
+index 197800c..253433e 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/viewmodel/MainViewModel.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/viewmodel/MainViewModel.kt
+@@ -156,6 +156,9 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
+     private val _resolution = MutableStateFlow(prefs.getString(Prefs.RESOLUTION, Prefs.DEF_RESOLUTION)!!)
+     val resolution: StateFlow<String> = _resolution.asStateFlow()
+ 
++    private val _rotation = MutableStateFlow(prefs.getInt(Prefs.ROTATION, Prefs.DEF_ROTATION))
++    val rotation: StateFlow<Int> = _rotation.asStateFlow()
++
+     private val _maxFps = MutableStateFlow(prefs.getInt(Prefs.MAX_FPS, Prefs.DEF_MAX_FPS))
+     val maxFps: StateFlow<Int> = _maxFps.asStateFlow()
+ 
+@@ -395,6 +398,7 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
+     fun setAlacEnabled(v: Boolean) { _alacEnabled.value = v; prefs.edit().putBoolean(Prefs.ALAC_ENABLED, v).apply(); _applyByServerRestart() }
+     fun setAacEnabled(v: Boolean) { _aacEnabled.value = v; prefs.edit().putBoolean(Prefs.AAC_ENABLED, v).apply(); _applyByServerRestart() }
+     fun setResolution(v: String) { _resolution.value = v; prefs.edit().putString(Prefs.RESOLUTION, v).apply(); _applyByServerRestart() }
++    fun setRotation(v: Int) { _rotation.value = v; prefs.edit().putInt(Prefs.ROTATION, v).apply(); _applyByServerRestart() }
+     fun setMaxFps(v: Int) { _maxFps.value = v; prefs.edit().putInt(Prefs.MAX_FPS, v).apply(); _applyByServerRestart() }
+     fun setOverscanned(v: Boolean) { _overscanned.value = v; prefs.edit().putBoolean(Prefs.OVERSCANNED, v).apply(); _applyByServerRestart() }
+     fun setRequirePin(v: Boolean) { _requirePin.value = v; prefs.edit().putBoolean(Prefs.REQUIRE_PIN, v).apply(); _applyByServerRestart() }
