@@ -1,3 +1,196 @@
+diff --git a/app/src/main/cpp/android_raop_callbacks.c b/app/src/main/cpp/android_raop_callbacks.c
+index 3b3b618..bd59d5b 100644
+--- a/app/src/main/cpp/android_raop_callbacks.c
++++ b/app/src/main/cpp/android_raop_callbacks.c
+@@ -64,6 +64,8 @@ void android_callbacks_init(android_callback_ctx_t *ctx, JNIEnv *env, jobject ca
+     ctx->on_progress = (*env)->GetMethodID(env, cls, "onProgress", "(JJJ)V");
+     ctx->on_dacp_id = (*env)->GetMethodID(env, cls, "onDacpId", "(Ljava/lang/String;Ljava/lang/String;)V");
+     ctx->on_mirror_running = (*env)->GetMethodID(env, cls, "onMirrorRunning", "(Z)V");
++    ctx->on_mirror_video_pause = (*env)->GetMethodID(env, cls, "onMirrorVideoPause", "()V");
++    ctx->on_mirror_video_resume = (*env)->GetMethodID(env, cls, "onMirrorVideoResume", "()V");
+     ctx->on_video_play = (*env)->GetMethodID(env, cls, "onVideoPlay", "(Ljava/lang/String;F)V");
+     ctx->on_video_scrub = (*env)->GetMethodID(env, cls, "onVideoScrub", "(F)V");
+     ctx->on_video_rate = (*env)->GetMethodID(env, cls, "onVideoRate", "(F)V");
+@@ -105,6 +107,7 @@ void android_callbacks_update_playback_info(android_callback_ctx_t *ctx, double
+ static void _audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
+     android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
+     if (!ctx->audio_engine || !data->data || data->data_len <= 0) return;
++
+     audio_engine_decode(ctx->audio_engine, data->data, data->data_len,
+                         (int)data->ct, (int64_t)data->ntp_time_local);
+ }
+@@ -195,8 +198,19 @@ static void _display_pin(void *cls, char *pin) {
+
+ /* Stubs for less critical callbacks */
+ static void _noop(void *cls) { (void)cls; }
+-static void _video_pause(void *cls) { LOGI("video_pause"); }
+-static void _video_resume(void *cls) { LOGI("video_resume"); }
++static void _video_pause(void *cls) {
++    android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
++    JNIEnv *env = _get_env(ctx);
++    LOGI("video_pause");
++    if (env) (*env)->CallVoidMethod(env, ctx->callback_obj, ctx->on_mirror_video_pause);
++}
++
++static void _video_resume(void *cls) {
++    android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
++    JNIEnv *env = _get_env(ctx);
++    LOGI("video_resume");
++    if (env) (*env)->CallVoidMethod(env, ctx->callback_obj, ctx->on_mirror_video_resume);
++}
+ static void _conn_feedback(void *cls) { (void)cls; }
+ static void _video_stop(void *cls);
+ static void _video_reset(void *cls, reset_type_t t) {
+@@ -218,11 +232,18 @@ static void _video_reset(void *cls, reset_type_t t) {
+         raop_remove_hls_connections(ctx->raop);
+     }
+ }
+-static void _audio_flush(void *cls) { LOGI("audio_flush"); }
++static void _audio_flush(void *cls) {
++    android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
++    LOGI("audio_flush");
++    if (ctx->audio_engine) audio_engine_flush(ctx->audio_engine);
++}
+
+ static void _audio_stop_coverart_rendering(void *cls) {
+     android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
+     LOGI("audio_teardown");
++    // Short-video apps tear down and recreate audio for every clip without always
++    // sending audio_flush. Treat teardown as the same hard discontinuity.
++    if (ctx->audio_engine) audio_engine_flush(ctx->audio_engine);
+     JNIEnv *env = _get_env(ctx);
+     if (!env) return;
+     (*env)->CallVoidMethod(env, ctx->callback_obj, ctx->on_audio_teardown);
+diff --git a/app/src/main/cpp/android_raop_callbacks.h b/app/src/main/cpp/android_raop_callbacks.h
+index 43e9908..a0e479e 100644
+--- a/app/src/main/cpp/android_raop_callbacks.h
++++ b/app/src/main/cpp/android_raop_callbacks.h
+@@ -29,6 +29,8 @@ typedef struct {
+     jmethodID on_progress;
+     jmethodID on_dacp_id;
+     jmethodID on_mirror_running;
++    jmethodID on_mirror_video_pause;
++    jmethodID on_mirror_video_resume;
+     jmethodID on_video_play;
+     jmethodID on_video_scrub;
+     jmethodID on_video_rate;
+diff --git a/app/src/main/cpp/audio_engine.cpp b/app/src/main/cpp/audio_engine.cpp
+index c3e2c70..2b3eb0a 100644
+--- a/app/src/main/cpp/audio_engine.cpp
++++ b/app/src/main/cpp/audio_engine.cpp
+@@ -88,6 +88,28 @@ struct AudioEngine {
+         }
+     }
+
++    void flush() {
++        // RAOP may deliver flush on a control thread while its audio thread is finishing
++        // a packet. Serialize the boundary so pre-flush PCM cannot land in the fresh ring.
++        std::lock_guard<std::mutex> decodeLk(mDecodeLock);
++        std::lock_guard<std::mutex> rebuildLk(mRebuildLock);
++        if (!mTimeline) return;
++
++        // MediaCodec drains on its own thread. Destroy it before clearing the timeline
++        // so a late output buffer from the previous clip cannot repopulate the fresh ring.
++        mDecoder = {};
++        mRetryAtNs = 0;
++
++        // Flush Android's device queue as well as our ring (the audible "previous clip").
++        // Keep the stream open: cold-opening AAudio takes seconds on some Sony TVs.
++        if (mOutput && mOutputActive) {
++            mOutputActive = mOutput->flushAndRestart();
++        } else {
++            mTimeline->flushAndReprime();
++        }
++        mTimeline->reanchorTracker();
++    }
++
+     // touches decoder: must not run concurrently with decode()
+     void stop() {
+         if (mOutput) mOutput->stop();
+@@ -119,6 +141,7 @@ struct AudioEngine {
+
+     // touches decoder: must not run concurrently with stop()
+     void decode(const uint8_t *data, size_t len, int ct, int64_t ptsNs) {
++        std::lock_guard<std::mutex> decodeLk(mDecodeLock);
+         if (!mTimeline) return;
+         if (mPending.load(std::memory_order_relaxed)) {
+             if (AudioConfig *raw = mPending.exchange(nullptr, std::memory_order_acquire)) {
+@@ -179,6 +202,9 @@ private:
+     // teardown stop() requires caller to guarantee no in-flight or future decode() calls
+
+     std::mutex mRebuildLock;
++    // establishes an exact packet boundary for flush; the RAOP control and audio
++    // callbacks may run on different threads
++    std::mutex mDecodeLock;
+     std::shared_ptr<TimelineBuffer> mTimeline; // guarded by mRebuildLock
+     std::shared_ptr<AudioOutput> mOutput;      // guarded by mRebuildLock
+     bool mRunning = false;                     // requested output state, guarded by mRebuildLock
+@@ -242,6 +268,10 @@ void audio_engine_pause(AudioEngine *engine) {
+     if (engine) engine->pause();
+ }
+
++void audio_engine_flush(AudioEngine *engine) {
++    if (engine) engine->flush();
++}
++
+ bool audio_engine_get_debug(AudioEngine *engine, void *dst, size_t dstLen) {
+     if (!engine || !dst) return false;
+     return engine->copyDebug(dst, dstLen);
+diff --git a/app/src/main/cpp/audio_engine.h b/app/src/main/cpp/audio_engine.h
+index 1284d45..ae7e9da 100644
+--- a/app/src/main/cpp/audio_engine.h
++++ b/app/src/main/cpp/audio_engine.h
+@@ -39,2 +39,6 @@ void audio_engine_pause(AudioEngine *engine);
+-/* refresh + copy packed debug struct into dst; false if engine NULL or dstLen too small */
++/* sender announced a stream discontinuity: discard decoded and device-buffered audio,
++ * then resume playout with a fresh prebuffer. safe to call while active. */
++void audio_engine_flush(AudioEngine *engine);
++
++/* refresh + copy packed debug struct into dst; false if engine NULL or dstLen too small */
+ bool audio_engine_get_debug(AudioEngine *engine, void *dst, size_t dstLen);
+diff --git a/app/src/main/cpp/audio_output.h b/app/src/main/cpp/audio_output.h
+index e6b0926..b817a9e 100644
+--- a/app/src/main/cpp/audio_output.h
++++ b/app/src/main/cpp/audio_output.h
+@@ -80,2 +80,37 @@ public:
+-    void stop() {
++    // Drop both the decoded timeline and frames already queued in Android without
++    // closing/reopening the device. Sony TVs take seconds to cold-open AAudio, while a
++    // pause/flush/start on the existing stream completes quickly.
++    bool flushAndRestart() {
++        std::lock_guard<std::mutex> lk(mLock);
++        mClosing.store(true);
++        if (!mStream) {
++            mTimeline->flushAndReprime();
++            mClosing.store(false);
++            return false;
++        }
++
++        const oboe::Result paused = mStream->pause();
++        if (paused == oboe::Result::OK) {
++            mTimeline->flushAndReprime();
++            const oboe::Result flushed = mStream->flush();
++            mClosing.store(false);
++            if (flushed == oboe::Result::OK && mStream->start() == oboe::Result::OK) {
++                return true;
++            }
++        }
++
++        // Backend does not support in-place flush: retain the safe cold-reopen fallback.
++        mStream->stop();
++        mStream->close();
++        mStream.reset();
++        mTimeline->flushAndReprime();
++        mClosing.store(false);
++        if (!openLocked()) return false;
++        if (mStream->requestStart() == oboe::Result::OK) return true;
++        mStream->close();
++        mStream.reset();
++        return false;
++    }
++
++    void stop() {
+         std::lock_guard<std::mutex> lk(mLock);
 diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt b/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
 index f4a643e..322b280 100644
 --- a/app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt
@@ -27,13 +220,13 @@ index d9e1ca4..8f44ff5 100644
 +    // clockwise rotation applied to the quad; 0/90/180/270
 +    private var rotationDeg = 0
 +    private var repaint = false
- 
+
      private var surfaceTexture: SurfaceTexture? = null
      var inputSurface: Surface? = null; private set
 @@ -55,6 +60,15 @@ class VideoPipeline {
          lock.notifyAll()
      }
- 
+
 +    // panel is mounted rotated: spin the quad, don't touch the decoder
 +    fun setRotation(deg: Int) = synchronized(lock) {
 +        val d = (((deg % 360) + 360) % 360) / 90 * 90
@@ -88,7 +281,7 @@ index d9e1ca4..8f44ff5 100644
 @@ -145,13 +170,34 @@ class VideoPipeline {
          _render()
      }
- 
+
 +    // maps the video into the window: rotate for a sideways-mounted panel, then
 +    // letterbox so the rotated picture keeps its aspect ratio
 +    private fun _updatePosMatrix() {
@@ -139,7 +332,7 @@ index d9e1ca4..8f44ff5 100644
 +            "  gl_Position = uPosMatrix * vec4(aPos, 0.0, 1.0);\n" +
              "  vTex = (uTexMatrix * vec4(aTex, 0.0, 1.0)).xy;\n" +
              "}\n"
- 
+
 diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt b/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
 index 1641aa5..5ca262b 100644
 --- a/app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt
@@ -147,7 +340,7 @@ index 1641aa5..5ca262b 100644
 @@ -47,6 +47,13 @@ class VideoRenderer(ctx: Context) {
      private var _ptsBaseUs = Long.MIN_VALUE
      private var _wallBaseNs = 0L
- 
+
 +    // clockwise degrees the picture is rotated by; for a physically rotated panel
 +    var rotationDegrees: Int = 0
 +        set(value) {
@@ -158,11 +351,32 @@ index 1641aa5..5ca262b 100644
      fun setResolution(w: Int, h: Int) {
          videoWidth = w
          videoHeight = h
+diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/bridge/RaopCallbackHandler.kt b/app/src/main/kotlin/io/github/jqssun/airplay/bridge/RaopCallbackHandler.kt
+index 8732267..5e9f638 100644
+--- a/app/src/main/kotlin/io/github/jqssun/airplay/bridge/RaopCallbackHandler.kt
++++ b/app/src/main/kotlin/io/github/jqssun/airplay/bridge/RaopCallbackHandler.kt
+@@ -16,6 +16,8 @@ interface RaopCallbackHandler {
+     fun onProgress(start: Long, curr: Long, end: Long)
+     fun onDacpId(dacpId: String, activeRemote: String)
+     fun onMirrorRunning(running: Boolean)
++    fun onMirrorVideoPause()
++    fun onMirrorVideoResume()
+     // video (hls), distinct from mirroring and raop audio
+     fun onVideoPlay(location: String, startPositionSeconds: Float)
+     fun onVideoScrub(positionSeconds: Float)
 diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt b/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
 index 9390300..de080c3 100644
 --- a/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
 +++ b/app/src/main/kotlin/io/github/jqssun/airplay/service/AirPlayService.kt
-@@ -390,6 +390,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+@@ -135,6 +135,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+     // set once mirroring reports a real size; stops with session
+     private val _mirroringActive = MutableStateFlow(false)
+     val mirroringActive = _mirroringActive.asStateFlow()
++    @Volatile private var _mirrorSessionRunning = false
+
+     private val _trackInfo = MutableStateFlow(TrackInfo())
+     val trackInfo = _trackInfo.asStateFlow()
+@@ -390,6 +391,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
          videoRenderer.benchmarkLog = prefs.getBoolean(Prefs.BENCHMARK_LOG, Prefs.DEF_BENCHMARK_LOG)
          videoRenderer.benchmarkLogCallback = { msg -> logCallback?.invoke(msg) }
          videoRenderer.scheduledOutputBufferRelease = prefs.getBoolean(Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE, Prefs.DEF_SCHEDULED_OUTPUT_BUFFER_RELEASE)
@@ -170,25 +384,35 @@ index 9390300..de080c3 100644
          NativeBridge.nativeSetH265Enabled(nativeHandle, h265)
          NativeBridge.nativeSetCodecs(nativeHandle, alac, aac)
          val advertiseVideo = prefs.getBoolean(Prefs.ADVERTISE_VIDEO, Prefs.DEF_ADVERTISE_VIDEO)
-@@ -807,6 +808,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+@@ -807,6 +809,8 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
      }
- 
+
      override fun onMirrorRunning(running: Boolean) {
-+        _broadcastSession(running)
++        _mirrorSessionRunning = running
++        _broadcastSession(active = running)
          if (running) videoRenderer.startSession() else {
              videoRenderer.stopSession()
              _mirroringActive.value = false
-@@ -814,6 +816,18 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+@@ -814,6 +818,27 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
          _setAudioOnly(!running)
      }
- 
+
++    override fun onMirrorVideoPause() {
++        if (_mirrorSessionRunning) _broadcastSession(active = true, stalled = true)
++    }
++
++    override fun onMirrorVideoResume() {
++        if (_mirrorSessionRunning) _broadcastSession(active = true, stalled = false)
++    }
++
 +    // lets a companion app (screen wake / idle standby) react to a session without
 +    // having to guess from network traffic. Harmless if nothing is listening.
-+    private fun _broadcastSession(active: Boolean) {
++    private fun _broadcastSession(active: Boolean, stalled: Boolean = false) {
 +        runCatching {
 +            sendBroadcast(
 +                Intent(SESSION_BROADCAST)
 +                    .putExtra("active", active)
++                    .putExtra("stalled", stalled)
 +                    .setPackage(SESSION_BROADCAST_TARGET)
 +            )
 +        }
@@ -197,7 +421,7 @@ index 9390300..de080c3 100644
      private fun _setAudioOnly(audioOnly: Boolean) {
          val prev = _audioOnly.value
          _audioOnly.value = audioOnly
-@@ -1109,6 +1123,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+@@ -1109,6 +1134,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
          private const val VOL_SYNC_MAX_STEPS = 32
          private const val VOL_SYNC_TIMEOUT_MS = 800L
          private const val CHANNEL_ID = "airplay_service"
@@ -226,7 +450,7 @@ index 81e662d..637e66b 100644
 +            aspectRatio = shownAspect
          )
      }
- 
+
 diff --git a/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt b/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt
 index 554fe10..ad9852b 100644
 --- a/app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt
@@ -242,7 +466,7 @@ index 554fe10..ad9852b 100644
 @@ -169,6 +170,17 @@ fun SettingsScreen(viewModel: MainViewModel) {
              onValueChange = { viewModel.setResolution(it) }
          )
- 
+
 +        SettingChipField(
 +            title = "Picture rotation",
 +            description = "Rotate the mirrored picture for a TV mounted sideways. " +
@@ -262,7 +486,7 @@ index 4f5f226..9cb8849 100644
 --- a/app/src/main/kotlin/io/github/jqssun/airplay/ui/theme/Theme.kt
 +++ b/app/src/main/kotlin/io/github/jqssun/airplay/ui/theme/Theme.kt
 @@ -12,7 +12,10 @@ import androidx.compose.ui.platform.LocalContext
- 
+
  @Composable
  fun AirPlayTheme(
 -    darkTheme: Boolean = isSystemInDarkTheme(),
@@ -280,13 +504,13 @@ index 197800c..253433e 100644
 @@ -156,6 +156,9 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
      private val _resolution = MutableStateFlow(prefs.getString(Prefs.RESOLUTION, Prefs.DEF_RESOLUTION)!!)
      val resolution: StateFlow<String> = _resolution.asStateFlow()
- 
+
 +    private val _rotation = MutableStateFlow(prefs.getInt(Prefs.ROTATION, Prefs.DEF_ROTATION))
 +    val rotation: StateFlow<Int> = _rotation.asStateFlow()
 +
      private val _maxFps = MutableStateFlow(prefs.getInt(Prefs.MAX_FPS, Prefs.DEF_MAX_FPS))
      val maxFps: StateFlow<Int> = _maxFps.asStateFlow()
- 
+
 @@ -395,6 +398,7 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
      fun setAlacEnabled(v: Boolean) { _alacEnabled.value = v; prefs.edit().putBoolean(Prefs.ALAC_ENABLED, v).apply(); _applyByServerRestart() }
      fun setAacEnabled(v: Boolean) { _aacEnabled.value = v; prefs.edit().putBoolean(Prefs.AAC_ENABLED, v).apply(); _applyByServerRestart() }
@@ -295,3 +519,191 @@ index 197800c..253433e 100644
      fun setMaxFps(v: Int) { _maxFps.value = v; prefs.edit().putInt(Prefs.MAX_FPS, v).apply(); _applyByServerRestart() }
      fun setOverscanned(v: Boolean) { _overscanned.value = v; prefs.edit().putBoolean(Prefs.OVERSCANNED, v).apply(); _applyByServerRestart() }
      fun setRequirePin(v: Boolean) { _requirePin.value = v; prefs.edit().putBoolean(Prefs.REQUIRE_PIN, v).apply(); _applyByServerRestart() }
+diff --git a/app/src/main/cpp/timeline_buffer.h b/app/src/main/cpp/timeline_buffer.h
+index ddaa6fa..ff08c63 100644
+--- a/app/src/main/cpp/timeline_buffer.h
++++ b/app/src/main/cpp/timeline_buffer.h
+@@ -2,6 +2,7 @@
+ #define TIMELINE_BUFFER_H
+
+ #include <algorithm>
++#include <android/log.h>
+ #include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+@@ -145,7 +146,9 @@ private:
+     }
+
+     static constexpr int MIN_CUSHION_MS = 0;             // algorithm already enforces effective floor
+-    static constexpr int MAX_CUSHION_MS = 1000;
++    // Mirroring must stay interactive. A one-second adaptive cushion can turn a
++    // short clip switch into two seconds of priming followed by a backlog trim.
++    static constexpr int MAX_CUSHION_MS = 160;
+     static constexpr int BUCKET_MS = 5;                  // histogram granularity
+     static constexpr int NBUCKETS = MAX_CUSHION_MS / BUCKET_MS;
+     static constexpr int64_t BUCKET_NS = (int64_t)BUCKET_MS * 1000000LL;
+@@ -210,16 +213,17 @@ public:
+         : mSampleRate(sampleRate),
+           mChannels(channels),
+           mTracker(sampleRate, channels, staticCushionMs, percentilePct),
+-          // ring can't be reallocated mid-stream: size for worst-case backlog, i.e. cap
+-          // of largest reachable cushion + one throttle window of overshoot (trims are
+-          // throttled), 2x slack
+-          mRing(2 * capOf(mTracker.ceil()) + (size_t)sampleRate * TRIM_THROTTLE_MS / 1000 * channels) {}
++          // iOS mirroring may deliver roughly three seconds of AAC in one burst. This
++          // is future playout data, not stale latency, so retain it and let the audio
++          // device consume it at the normal sample rate.
++          mRing((size_t)sampleRate * RING_SECONDS * channels) {}
+
+     void noteOutputBufferFrames(int frames) { mTracker.noteOutputBufferFrames(frames); }
+
+     // producer: push samples
+     void write(const int16_t *pcm, size_t samples, int64_t ptsNs) {
+         if (samples == 0) return;
++        const int64_t arrivalNs = monoNs();
+         // pts 0 = sender clock not NTP synced yet
+         if (ptsNs == 0) {
+             mRing.write(pcm, samples);
+@@ -232,19 +236,20 @@ public:
+         if (mUnderran.exchange(false, std::memory_order_relaxed)) {
+             mExpectedPtsNs = ptsNs;
+         }
+-        const int64_t gapNs = ptsNs - mExpectedPtsNs;
++        const int64_t gapNs = mExpectedPtsNs == 0 ? 0 : ptsNs - mExpectedPtsNs;
+
+-        // large gap: possible discontinuity or clock shift. reanchor() must precede
+-        // observe() so the reset applies to this observation
+-        if (gapNs > MAX_GAP_NS || gapNs < -MAX_GAP_NS) mTracker.reanchor();
++        // A large timestamp jump is another clip/clock discontinuity. Clearing the
++        // queued tail here prevents silence insertion/backlog trimming from causing
++        // the characteristic delayed start followed by a sudden catch-up.
++        if (gapNs > MAX_GAP_NS || gapNs < -MAX_GAP_NS) {
++            requestDiscontinuity(ptsNs, samples, gapNs);
++            return;
++        }
+
+         // no-op in static-cushion mode
+-        mTracker.observe(ptsNs, monoNs(), durNs);
++        mTracker.observe(ptsNs, arrivalNs, durNs);
+
+-        if (gapNs > MAX_GAP_NS || gapNs < -MAX_GAP_NS) {
+-            // discontinuity: write immediately. new sound after long silence resets
+-            // backlog to ideal size (less latency); on clock resync we keep the sound
+-        } else if (gapNs > SLACK_NS) {
++        if (gapNs > SLACK_NS) {
+             // sender left gap: reproduce as silence so timing is exact
+             const size_t silenceFrames = (size_t)(gapNs * mSampleRate / NS_PER_SEC);
+             writeSilenceFrames(silenceFrames);
+@@ -262,25 +267,16 @@ public:
+     void read(int16_t *out, int32_t frames) {
+         const size_t need = (size_t)frames * mChannels;
+         const size_t tuned = mTracker.target();
+-        const int64_t now = monoNs();
+-
+-        // bound latency: cap tracks tuned cushion live so a calmed link sheds latency
+-        // without an underrun. each trim costs a glitch, so be conservative: trim only
+-        // after backlog stayed above cap for TRIM_SUSTAIN (skip transient spikes), at
+-        // most once per TRIM_THROTTLE, and not within that window of an underrun
+-        // (trimming while rebuilding cushion is counterproductive)
+-        const size_t avail = mRing.available();
+-        if (avail > capOf(tuned)) {
+-            if (mAboveCapSinceNs == 0) mAboveCapSinceNs = now;
+-        } else {
+-            mAboveCapSinceNs = 0;
+-        }
+-        if (mAboveCapSinceNs != 0 && now - mAboveCapSinceNs >= TRIM_SUSTAIN_NS
+-                && now - mLastTrimBlockNs >= TRIM_THROTTLE_NS) {
+-            mRing.skip(avail - tuned);
+-            mMetrics.countTrim();
+-            mLastTrimBlockNs = now;
+-            mAboveCapSinceNs = 0;
++
++        // Producer detected an in-session clip boundary. skip() belongs to the sole
++        // consumer, so it is safe while the producer continues writing. Any packets
++        // that arrived between the request and this callback are intentionally stale
++        // boundary data and are discarded as well.
++        if (mDiscontinuityRequested.exchange(false, std::memory_order_acquire)) {
++            mRing.skip(mRing.available());
++            mPriming = true;
++            mPrimeSilenceFrames = 0;
++            mUnderran.store(false, std::memory_order_relaxed);
+         }
+
+         // prebuffer: hold output until cushion fills, builds jitter headroom
+@@ -309,7 +305,6 @@ public:
+         if (got < need) {
+             memset(out + got, 0, (need - got) * sizeof(int16_t));
+             mPriming = true;
+-            mLastTrimBlockNs = now;  // hold off trims while rebuilding
+             mUnderran.store(true, std::memory_order_relaxed);  // producer re-anchors
+             mMetrics.countUnderrun();
+         }
+@@ -328,6 +323,11 @@ public:
+     void flushAndReprime() {
+         mRing.skip(mRing.available());
+         mPriming = true;
++        mPrimeSilenceFrames = 0;
++        mExpectedPtsNs = 0;
++        mDiscontinuityRequested.store(false, std::memory_order_relaxed);
++        mUnderran.store(false, std::memory_order_relaxed);
++        mTracker.reanchor();
+     }
+
+     // debug snapshot: backlog + tuned cushion (ms) + counters; reads only atomics, any thread
+@@ -346,10 +346,24 @@ public:
+
+ private:
+
+-    // latency ceiling for cushion: 2x, but never below TRIM_FLOOR_MS so tiny cushion
+-    // still gets slack before a trim (trim costs a glitch)
+-    size_t capOf(size_t cushionSamples) const {
+-        return std::max(cushionSamples * 2, (size_t)mSampleRate * TRIM_FLOOR_MS / 1000 * mChannels);
++    // Producer-side boundary handler. The first packet is deliberately dropped;
++    // requestDiscontinuity() advances the expected PTS so the following packet can
++    // start a clean timeline after the consumer has removed the stale queue.
++    void requestDiscontinuity(int64_t ptsNs, size_t samples, int64_t deltaNs) {
++        __android_log_print(ANDROID_LOG_INFO, "AirPlayAudio",
++                            "timeline reset: reason=pts delta=%.1fms backlog=%zums cushion=%zums",
++                            deltaNs / 1e6,
++                            mRing.available() / mChannels * 1000 / mSampleRate,
++                            mTracker.target() / mChannels * 1000 / mSampleRate);
++        mTracker.reanchor();
++        if (ptsNs == 0) {
++            mExpectedPtsNs = 0;
++        } else {
++            const int64_t durNs = samples * NS_PER_SEC / mChannels / mSampleRate;
++            mExpectedPtsNs = ptsNs + durNs;
++        }
++        mUnderran.store(false, std::memory_order_relaxed);
++        mDiscontinuityRequested.store(true, std::memory_order_release);
+     }
+
+     void writeSilenceFrames(size_t frames) {
+@@ -363,12 +377,10 @@ private:
+     }
+
+     static constexpr int64_t SLACK_NS = 10'000'000LL;    // ignore <10ms gaps (NTP shift, rounding)
+-    static constexpr int64_t MAX_GAP_NS = 750'000'000LL; // >750ms = discontinuity, re-anchor
+-    static constexpr int TRIM_FLOOR_MS = 30;             // min trim point even for tiny cushion
+-    static constexpr int TRIM_THROTTLE_MS = 2000;        // min spacing between trims, and after underrun
+-    static constexpr int64_t TRIM_THROTTLE_NS = (int64_t)TRIM_THROTTLE_MS * 1'000'000LL;
+-    static constexpr int TRIM_SUSTAIN_MS = 2000;         // backlog must exceed cap this long before trim
+-    static constexpr int64_t TRIM_SUSTAIN_NS = (int64_t)TRIM_SUSTAIN_MS * 1'000'000LL;
++    // One missing AAC-LC packet is about 23ms. Beyond 40ms, treating a PTS jump as
++    // ordinary overlap/gap makes us drop audio until the new clip catches up.
++    static constexpr int64_t MAX_GAP_NS = 40'000'000LL;
++    static constexpr int RING_SECONDS = 8;
+
+     const int mSampleRate;
+     const int mChannels;
+@@ -377,9 +389,8 @@ private:
+     TimelineMetrics mMetrics;
+     bool mPriming = true;                // stream start: buffer output to build cushion
+     uint32_t mPrimeSilenceFrames = 0;    // consumer-only: silence frames output while priming with partial data
+-    int64_t mLastTrimBlockNs = 0;        // consumer-only: last trim/underrun time (trim throttle)
+-    int64_t mAboveCapSinceNs = 0;        // consumer-only: when backlog first exceeded cap (0 = under)
+     std::atomic<bool> mUnderran{false};  // consumer->producer: underrun happened
++    std::atomic<bool> mDiscontinuityRequested{false}; // producer->consumer: discard stale clip tail
+
+     int64_t mExpectedPtsNs = 0;          // presentation time expected at write head
+ };

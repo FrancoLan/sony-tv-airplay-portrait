@@ -6,7 +6,7 @@ Portrait AirPlay mirroring for a sideways-mounted Sony Android TV, with automati
 
 ## What it includes
 
-- `airplay-portrait/` — a reproducible patch set for [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server) that rotates mirrored video and reports exact session state.
+- `airplay-portrait/` — a reproducible patch set for [jqssun/android-airplay-server](https://github.com/jqssun/android-airplay-server) that rotates mirrored video and reports exact session, lock, and resume state.
 - `AirPlayGuard/` — an Android TV companion app that keeps the receiver discoverable, wakes the panel for mirroring, and puts it back to sleep afterward.
 - `setup-tv.sh` — installs both apps and grants Android TV permissions that have no graphical setup flow.
 
@@ -66,9 +66,9 @@ Recommended audio settings for the tested Sony TV:
 
 ## How it works
 
-The receiver patch rotates the decoded texture in the existing OpenGL composition pass, so rotation does not add another video copy. It also broadcasts mirroring state to AirPlayGuard.
+The receiver patch rotates the decoded texture in the existing OpenGL composition pass, so rotation does not add another video copy. It also broadcasts mirroring, sender-lock, and resume state to AirPlayGuard. AirPlay audio flush events clear the encrypted RTP queue, decoder PCM, and Android/TV output queue as one timeline boundary. A missing RTP sequence is allowed 80 ms for retransmission and is then skipped, preventing one lost packet from holding almost 256 packets and releasing them seconds late. The existing AAudio stream is flushed in place, avoiding the multi-second device reopen delay seen on Sony TVs.
 
-AirPlayGuard holds the multicast and network locks needed for discovery during standby. During an active session it pauses its TCP health probe because the receiver treats a raw probe as a real AirPlay connection, which can otherwise flush playback every 30 seconds. When mirroring ends, the guard displays a cancellable countdown and uses Android device-admin locking to turn the panel off.
+AirPlayGuard holds the multicast and network locks needed for discovery during standby. During an active session it pauses its TCP health probe because the receiver treats a raw probe as a real AirPlay connection, which can otherwise flush playback every 30 seconds. When mirroring ends or iOS suspends video because the phone was locked, the guard covers the frozen final frame with a cancellable countdown and uses Android device-admin locking to turn the panel off. Resuming video cancels the countdown. Once exact session broadcasts are available, residual network traffic is no longer allowed to wake the panel again.
 
 ## Known limitations
 

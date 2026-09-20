@@ -162,11 +162,14 @@ class GuardService : Service() {
                 when {
                     kbps >= prefs.wakeKBps -> {
                         markActive()
-                        // Ignore only the short tail after our own sleep request. Keeping
-                        // this permanent prevented senders such as Douyin live from using
-                        // traffic to bring the receiver forward before a session callback.
+                        // Before the first exact broadcast, traffic remains the fallback
+                        // wake path (needed by senders such as Douyin live). Once this
+                        // receiver has proved it broadcasts exact state, never let stale
+                        // post-session traffic turn the panel straight back on.
                         val wakeSuppressed = SystemClock.elapsedRealtime() < suppressTrafficWakeUntil
-                        if (!display.isScreenOn && !videoStalled && !wakeSuppressed) {
+                        if (!display.isScreenOn && !videoStalled && !wakeSuppressed &&
+                            !sawSessionBroadcast
+                        ) {
                             wakeNow("traffic ${kbps.toInt()} KB/s")
                         }
                     }
@@ -208,6 +211,15 @@ class GuardService : Service() {
         Log.i(TAG, "waking screen: $reason")
         Status.lastWakeReason = reason
         markActive()
+        // WakeActivity briefly owns the foreground window and therefore destroys the
+        // receiver's SurfaceView on this Sony. It is needed only to light a sleeping
+        // panel; when the panel is already on, the receiver is already responsible for
+        // bringing its own activity forward and must keep its video surface intact.
+        if (display.isScreenOn) {
+            Log.i(TAG, "screen already on; launching receiver without WakeActivity")
+            prefs.receiverPackage.takeIf { probe.isInstalled(it) }?.let { probe.launch(it) }
+            return
+        }
         display.wake(prefs.receiverPackage.takeIf { probe.isInstalled(it) })
     }
 

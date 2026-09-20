@@ -1,0 +1,83 @@
+diff --git a/lib/raop_buffer.c b/lib/raop_buffer.c
+index d0ed368..d767358 100644
+--- a/lib/raop_buffer.c
++++ b/lib/raop_buffer.c
+@@ -25,6 +25,7 @@
+
+ #include "raop_buffer.h"
+ #include "raop_rtp.h"
++#include "raop_ntp.h"
+
+ #include "crypto.h"
+ #include "compat.h"
+@@ -34,6 +35,7 @@
+ #include "byteutils.h"
+
+ #define RAOP_BUFFER_LENGTH 256
++#define RAOP_RESEND_WAIT_NS 80000000ULL
+
+ typedef struct {
+     /* Data available */
+@@ -206,6 +208,7 @@ raop_buffer_enqueue(raop_buffer_t *raop_buffer, unsigned char *data, unsigned sh
+     /* Update the raop_buffer entry header */
+     entry->seqnum = seqnum;
+     entry->rtp_timestamp = byteutils_get_int_be(data, 4);
++    entry->packet_arrival_time = raop_ntp_get_local_time();
+     entry->filled = 1;
+
+     entry->payload_data = malloc(payload_size);
+@@ -243,8 +246,34 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
+     } else if (!entry->filled) {
+         /* Check how much we have space left in the buffer */
+         if (entry_count < RAOP_BUFFER_LENGTH) {
+-            /* Return nothing and hope resend gets on time */
+-            return NULL;
++            /*
++             * Wait briefly for a normal resend, but never let one missing sequence
++             * stall the entire stream until all 256 slots fill.  iOS can jump the
++             * sequence number after a seek or a video/live transition without a
++             * timely RTSP FLUSH; the old behavior then released a multi-second batch.
++             */
++            unsigned short next_seqnum = raop_buffer->first_seqnum + 1;
++            raop_buffer_entry_t *next_entry = NULL;
++            while (seqnum_cmp(next_seqnum, raop_buffer->last_seqnum) <= 0) {
++                raop_buffer_entry_t *candidate =
++                    &raop_buffer->entries[next_seqnum % RAOP_BUFFER_LENGTH];
++                if (candidate->filled && seqnum_cmp(candidate->seqnum, next_seqnum) == 0) {
++                    next_entry = candidate;
++                    break;
++                }
++                next_seqnum++;
++            }
++            if (!next_entry ||
++                raop_ntp_get_local_time() - next_entry->packet_arrival_time < RAOP_RESEND_WAIT_NS) {
++                /* Return nothing and give the resend up to 80 ms to arrive. */
++                return NULL;
++            }
++
++            logger_log(raop_buffer->logger, LOGGER_WARNING,
++                       "audio resend timeout: skipping seqnum %u through %u",
++                       raop_buffer->first_seqnum, (unsigned short)(next_seqnum - 1));
++            raop_buffer->first_seqnum = next_seqnum;
++            entry = next_entry;
+         }
+         /* Risk of buffer overrun, return empty buffer */
+     }
+diff --git a/lib/raop_rtp.c b/lib/raop_rtp.c
+index 35d42df..6d2a0b9 100644
+--- a/lib/raop_rtp.c
++++ b/lib/raop_rtp.c
+@@ -318,6 +318,13 @@ raop_rtp_process_events(raop_rtp_t *raop_rtp, void *cb_data)
+
+     /* Handle flush if requested */
+     if (flush != NO_FLUSH) {
++        /*
++         * FLUSH is a media timeline boundary.  Clear the encrypted RTP/retransmit
++         * queue before flushing the decoder/output callback, otherwise a missing
++         * pre-seek sequence can hold the new audio for several seconds and then
++         * release the whole stale batch at once.
++         */
++        raop_buffer_flush(raop_rtp->buffer, flush);
+         if (raop_rtp->callbacks.audio_flush) {
+             raop_rtp->callbacks.audio_flush(raop_rtp->callbacks.cls);
+         }

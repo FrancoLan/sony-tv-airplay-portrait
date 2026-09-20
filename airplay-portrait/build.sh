@@ -23,6 +23,7 @@ mkdir -p "$BUILD_ROOT"
 
 COMMIT="$(cat "$HERE/patches/UPSTREAM_COMMIT")"
 PATCH="$HERE/patches/0001-portrait-rotation.patch"
+UXPLAY_PATCH="$HERE/patches/0002-uxplay-audio-queue.patch"
 
 # Kept in sync with upstream app/build.gradle.kts — a mismatch fails the native build.
 NDK_VERSION="27.0.12077973"
@@ -97,6 +98,12 @@ ln -sfn "$SRC" "$HERE/src"
 
 say "Fetching native submodules (UxPlay core) — this takes a while the first time"
 git -C "$SRC" submodule update --init --recursive
+
+say "Applying UxPlay audio queue patch"
+UXPLAY_SRC="$SRC/app/src/main/cpp/third_party/UxPlay"
+git -C "$UXPLAY_SRC" reset --hard --quiet
+git -C "$UXPLAY_SRC" clean -fd --quiet
+git -C "$UXPLAY_SRC" apply --verbose "$UXPLAY_PATCH"
 
 say "Building release APK"
 ( cd "$SRC" && ./gradlew --no-daemon assembleRelease )
