@@ -26,6 +26,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Keeps a sideways-mounted TV discoverable while the panel is off, lights it up when a
@@ -47,6 +48,7 @@ class GuardService : Service() {
     private lateinit var probe: ReceiverProbe
     private lateinit var countdown: CountdownOverlay
     private val traffic = TrafficMonitor()
+    private val receiverCheckInFlight = AtomicBoolean(false)
 
     private var job: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -126,6 +128,7 @@ class GuardService : Service() {
                 markActive()
             }
             ACTION_WAKE_NOW -> wakeNow("manual")
+            ACTION_ENSURE_RECEIVER, null -> requestReceiverCheck()
         }
         return START_STICKY
     }
@@ -177,7 +180,7 @@ class GuardService : Service() {
                 }
 
                 maybeSleep()
-                if (tick % PROBE_EVERY_TICKS == 0L) checkReceiverAlive()
+                if (tick % PROBE_EVERY_TICKS == 0L) requestReceiverCheck()
                 if (tick % NOTIFY_EVERY_TICKS == 0L) updateNotification()
             }
         }
@@ -242,6 +245,17 @@ class GuardService : Service() {
      * A receiver that has been killed stops answering discovery and the phone just sees
      * nothing. Relaunching does not light the panel.
      */
+    private fun requestReceiverCheck() {
+        if (!receiverCheckInFlight.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                checkReceiverAlive()
+            } finally {
+                receiverCheckInFlight.set(false)
+            }
+        }
+    }
+
     private fun checkReceiverAlive() {
         // A TCP connect to the AirPlay port is observable as a real client connection by
         // the receiver. During playback it consequently runs video_flush, which produces
@@ -335,6 +349,7 @@ class GuardService : Service() {
     companion object {
         const val ACTION_SLEEP_NOW = "dev.frank.airplayguard.SLEEP_NOW"
         const val ACTION_WAKE_NOW = "dev.frank.airplayguard.WAKE_NOW"
+        const val ACTION_ENSURE_RECEIVER = "dev.frank.airplayguard.ENSURE_RECEIVER"
 
         /** Sent by the patched receiver app when a mirroring session starts or stops. */
         const val SESSION_ACTION = "dev.frank.airplayguard.SESSION"
@@ -347,7 +362,11 @@ class GuardService : Service() {
         private const val POST_SLEEP_WAKE_SUPPRESSION_MS = 30_000L
 
         fun start(context: Context) {
+            // Do not wait for the periodic 30-second probe after a TV boot, app update,
+            // or an explicit guard restart. If Android killed the receiver, that delay is
+            // long enough for the phone to report that no AirPlay target exists.
             val intent = Intent(context, GuardService::class.java)
+                .setAction(ACTION_ENSURE_RECEIVER)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
         }

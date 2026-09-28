@@ -48,7 +48,17 @@ class WakeActivity : Activity() {
             Log.w(TAG, "no launch intent for $pkg")
             return
         }
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+        // This Sony destroys the receiver window's Surface when WakeActivity takes
+        // focus from a sleeping panel. Merely bringing the singleTop receiver activity
+        // forward leaves it resumed with NO_SURFACE, producing a permanently black
+        // screen. Recreate only the receiver task after the panel is awake; its
+        // foreground AirPlayService stays alive and attaches the session to the new
+        // SurfaceView.
+        intent.addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                Intent.FLAG_ACTIVITY_NO_ANIMATION
+        )
         runCatching { startActivity(intent) }
             .onFailure { Log.w(TAG, "could not bring $pkg forward", it) }
     }

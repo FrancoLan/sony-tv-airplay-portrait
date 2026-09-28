@@ -29,8 +29,10 @@ AirPlayGuard already consumes these states. A stalled session starts the normal 
 ### Display and power constraints
 
 - When the TV panel is already on, Guard launches the receiver directly and must not open `WakeActivity`; doing so destroys the receiver SurfaceView and removes the picture.
+- When the panel really is asleep, `WakeActivity` must recreate the receiver activity task during handoff (`NEW_TASK | CLEAR_TASK`). On this Sony, merely bringing the existing `singleTop` activity forward leaves it resumed with `NO_SURFACE`, causing a permanent black screen. The receiver foreground service remains alive and reattaches the session to the new SurfaceView.
 - Exact receiver broadcasts permanently supersede traffic-based wake for this receiver. This prevents residual/audio traffic from waking the panel immediately after automatic sleep.
 - TCP liveness probing remains disabled during an active session because a raw probe looks like a real AirPlay connection and can flush playback.
+- Guard startup, package replacement, and explicit service restart now request an immediate receiver liveness check instead of waiting for the 30-second periodic probe. Checks are coalesced so startup and the periodic loop cannot probe concurrently. This fixes the TV reopening on the Guard screen while the killed receiver remains undiscoverable to the phone.
 
 ### Reproducible build
 
