@@ -22,12 +22,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -35,7 +35,7 @@ jobs:
           cache-dependency-path: AirPlayGuard/**/*.gradle*
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           # The action's legacy default also requests the removed `tools` package.
           packages: platform-tools
@@ -51,7 +51,7 @@ jobs:
         run: ./gradlew --no-daemon test assembleRelease
 
       - name: Upload AirPlayGuard APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: airplay-guard-${{ github.sha }}
           path: AirPlayGuard/app/build/outputs/apk/release/app-release.apk
