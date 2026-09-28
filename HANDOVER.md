@@ -42,7 +42,7 @@ The receiver is pinned to upstream commit `c8defdd70d7e6a04f4f1b71d353653682d594
 
 - `main` is the deployable branch. Do not develop directly on it.
 - Use a short-lived `fix/*`, `feat/*`, or `chore/*` branch and open a pull request back to `main`, including for solo maintenance.
-- The required `Guard build` check runs `git diff --check`, `./gradlew test`, and `./gradlew assembleRelease`, then retains the Guard APK as a 14-day workflow artifact.
+- The required `Guard build` check runs on pinned Ubuntu 24.04, executes `git diff --check`, `./gradlew test`, and `./gradlew assembleRelease`, then retains the Guard APK as a 14-day workflow artifact.
 - Test hardware-sensitive receiver, audio, wake/sleep, and Surface lifecycle changes on the Sony TV before merging; CI cannot replace the device check.
 - Create immutable version tags and GitHub Releases only from merged `main`. Never move an existing release tag.
 - For an urgent TV outage, an administrator may bypass protection to restore service, but must immediately put the exact tested change on a `hotfix/*` branch and reconcile it through a pull request.
