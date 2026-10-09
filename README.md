@@ -64,6 +64,8 @@ Recommended audio settings for the tested Sony TV:
 | Software audio buffer | 120 ms |
 | Hardware output buffer | 0 (automatic) |
 
+On the tested Sony, the receiver maps the iPhone's 16 audible volume steps to TV levels `2, 4, 6, ... 32`. This keeps the full phone control range while limiting the TV's unusually loud system scale.
+
 ## How it works
 
 The receiver patch rotates the decoded texture in the existing OpenGL composition pass, so rotation does not add another video copy. It also broadcasts mirroring, sender-lock, and resume state to AirPlayGuard. AirPlay audio flush events clear the encrypted RTP queue, decoder PCM, and Android/TV output queue as one timeline boundary. A missing RTP sequence is allowed 80 ms for retransmission and is then skipped, preventing one lost packet from holding almost 256 packets and releasing them seconds late. The existing AAudio stream is flushed in place, avoiding the multi-second device reopen delay seen on Sony TVs.
