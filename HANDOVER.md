@@ -2,7 +2,7 @@
 
 ## Stable baseline — 2026-09-20
 
-The tested target is a Sony KD-55X8000H at `192.168.1.124:5555`, running the patched receiver package `io.github.jqssun.airplay` and companion package `dev.frank.airplayguard`.
+The tested target is a Sony KD-55X8000H at `192.168.1.124:5555`, running the patched receiver package `io.github.jqssun.airplay` and companion package `dev.frank.airplayguard`. The router has a DHCP reservation for `.124`; immediately after TV startup, port 5555 can still take several seconds to become reachable.
 
 ### Do not regress the Douyin audio path
 
@@ -15,6 +15,12 @@ Rapid video swiping, seeking, and switching between videos and live rooms are cu
 - The software timeline ring is eight seconds; adaptive output cushion is capped at 160 ms.
 
 Recommended receiver audio settings on this TV: low latency off, override audio delay 250 ms, automatic software buffer off, software buffer 120 ms, hardware output buffer automatic/0.
+
+### AirPlay volume curve — device-verified 2026-10-09
+
+The Sony's system music-volume scale is 0–100 and is unusually loud with the upstream one-to-one AirPlay mapping. `AirPlayService` now scales the sender fraction by `0.32`, so the iPhone's 16 audible steps map to TV levels `2, 4, 6, ... 32` instead of `6, 13, 19, ... 100`. The inverse conversion is also applied when a TV-side volume change is synchronized back to the sender, avoiding feedback jumps.
+
+This exact curve was installed and tested during live iPhone screen mirroring on the target TV. The user confirmed the result across the low steps. Preserve the 32% ceiling unless a new listening test on this TV justifies changing it.
 
 ### Phone-lock sleep path
 

@@ -376,7 +376,17 @@ index 9390300..de080c3 100644
 
      private val _trackInfo = MutableStateFlow(TrackInfo())
      val trackInfo = _trackInfo.asStateFlow()
-@@ -390,6 +391,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+@@ -286,7 +287,8 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+                 if (idx < 0 || prev < 0 || idx == prev) return
+                 if (_pendingVolEchoes > 0) { _pendingVolEchoes--; return }
+                 if (_connectionCount.value == 0) return
+-                val target = idx.toFloat() / audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
++                val deviceFrac = idx.toFloat() / audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
++                val target = (deviceFrac / AIRPLAY_VOLUME_CEILING).coerceIn(0f, 1f)
+                 Log.d(TAG, "local volume $prev -> $idx, sync sender to $target")
+                 _preZeroIdx = -1
+                 val active = _volSyncTarget >= 0f
+@@ -390,6 +392,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
          videoRenderer.benchmarkLog = prefs.getBoolean(Prefs.BENCHMARK_LOG, Prefs.DEF_BENCHMARK_LOG)
          videoRenderer.benchmarkLogCallback = { msg -> logCallback?.invoke(msg) }
          videoRenderer.scheduledOutputBufferRelease = prefs.getBoolean(Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE, Prefs.DEF_SCHEDULED_OUTPUT_BUFFER_RELEASE)
@@ -384,6 +394,46 @@ index 9390300..de080c3 100644
          NativeBridge.nativeSetH265Enabled(nativeHandle, h265)
          NativeBridge.nativeSetCodecs(nativeHandle, alac, aac)
          val advertiseVideo = prefs.getBoolean(Prefs.ADVERTISE_VIDEO, Prefs.DEF_ADVERTISE_VIDEO)
+@@ -655,29 +658,32 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+     }
+-
++
+     override fun onVolumeChange(volume: Float) {
+-        val frac = if (volume <= -144f) 0f else ((volume + 30f) / 30f).coerceIn(0f, 1f)
+-        _senderFrac = frac
+-        Log.d(TAG, "volume ${volume}dB, frac $frac")
++        val senderFrac = if (volume <= -144f) 0f else ((volume + 30f) / 30f).coerceIn(0f, 1f)
++        val deviceFrac = senderFrac * AIRPLAY_VOLUME_CEILING
++        _senderFrac = senderFrac
++        Log.d(TAG, "volume ${volume}dB, sender frac $senderFrac, device frac $deviceFrac")
+         _mainHandler.post {
+             if (_volSyncTarget >= 0f) {
+                 _volSyncStep()
+                 return@post
+             }
+             val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+             val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+-            val idx = (frac * max).roundToInt()
++            val idx = (deviceFrac * max).roundToInt()
+             _preZeroIdx = if (idx == 0) (if (_preZeroIdx < 0) cur else _preZeroIdx) else -1
+             if (idx != cur) {
+                 _pendingVolEchoes++
+                 audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, idx, 0)
+             }
+         }
+     }
+-
++
+     override fun onClientVolume(): Float {
+         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+         val vol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+-        val db = if (vol == 0) -144f else -30f + 30f * vol / max
++        val deviceFrac = vol.toFloat() / max
++        val senderFrac = (deviceFrac / AIRPLAY_VOLUME_CEILING).coerceIn(0f, 1f)
++        val db = if (vol == 0) -144f else -30f + 30f * senderFrac
+         Log.d(TAG, "client volume query: $vol/$max -> ${db}dB")
+         return db
+     }
 @@ -807,6 +809,8 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
      }
 
@@ -421,10 +471,12 @@ index 9390300..de080c3 100644
      private fun _setAudioOnly(audioOnly: Boolean) {
          val prev = _audioOnly.value
          _audioOnly.value = audioOnly
-@@ -1109,6 +1134,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+@@ -1109,6 +1137,11 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
          private const val VOL_SYNC_MAX_STEPS = 32
          private const val VOL_SYNC_TIMEOUT_MS = 800L
          private const val CHANNEL_ID = "airplay_service"
++        // Map the iPhone's 16 volume steps to TV levels 2, 4, ... 32.
++        private const val AIRPLAY_VOLUME_CEILING = 0.32f
 +        // consumed by the AirPlayGuard companion app (screen wake / idle standby)
 +        const val SESSION_BROADCAST = "dev.frank.airplayguard.SESSION"
 +        const val SESSION_BROADCAST_TARGET = "dev.frank.airplayguard"
