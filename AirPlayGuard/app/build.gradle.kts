@@ -11,8 +11,8 @@ android {
         applicationId = "dev.frank.airplayguard"
         minSdk = 22          // Android 5.1 — covers every Android TV Sony ever shipped
         targetSdk = 33       // 33 keeps us out of Android 14's stricter FGS type enforcement
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.2"
     }
 
     buildTypes {
