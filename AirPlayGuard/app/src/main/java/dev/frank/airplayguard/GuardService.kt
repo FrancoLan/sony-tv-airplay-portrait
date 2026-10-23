@@ -71,11 +71,11 @@ class GuardService : Service() {
     @Volatile private var suppressTrafficWakeUntil = 0L
 
     /**
-     * Set once the patched receiver has reported a session. From then on the traffic
-     * heuristic is no longer allowed to wake the panel: we have exact information, and
-     * guessing on top of it is how a locked phone's audio stream switched the TV back on.
-     * Traffic stays as the wake path only for receivers that never broadcast (the TV's
-     * built-in AirPlay).
+     * Loaded from persistent receiver capability state and set when an exact session
+     * broadcast arrives. From then on the traffic heuristic is never allowed to wake the
+     * panel: we have exact information, and guessing on top of it is how background
+     * downloads or a locked phone's audio stream switched the TV back on. Traffic stays
+     * as the wake path only for receivers that never broadcast.
      */
     @Volatile private var sawSessionBroadcast = false
 
@@ -86,6 +86,7 @@ class GuardService : Service() {
             Log.i(TAG, "receiver reports session active=$active stalled=$stalled")
             if (!sawSessionBroadcast) {
                 sawSessionBroadcast = true
+                prefs.rememberExactSessionBroadcastReceiver()
                 Status.wakeSource = "会话广播（精确）"
             }
             markActive()
@@ -107,6 +108,15 @@ class GuardService : Service() {
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
+        sawSessionBroadcast = prefs.receiverUsesExactSessionBroadcast()
+        if (sawSessionBroadcast) {
+            Status.wakeSource = "会话广播（已记住）"
+        }
+        Log.i(
+            TAG,
+            "wake mode for ${prefs.receiverPackage}: " +
+                if (sawSessionBroadcast) "exact session broadcasts" else "traffic fallback"
+        )
         locks = NetworkLocks(this)
         display = DisplayController(this)
         probe = ReceiverProbe(this)

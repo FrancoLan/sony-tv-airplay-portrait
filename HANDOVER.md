@@ -37,8 +37,11 @@ AirPlayGuard already consumes these states. A stalled session starts the normal 
 - When the TV panel is already on, Guard launches the receiver directly and must not open `WakeActivity`; doing so destroys the receiver SurfaceView and removes the picture.
 - When the panel really is asleep, `WakeActivity` must recreate the receiver activity task during handoff (`NEW_TASK | CLEAR_TASK`). On this Sony, merely bringing the existing `singleTop` activity forward leaves it resumed with `NO_SURFACE`, causing a permanent black screen. The receiver foreground service remains alive and reattaches the session to the new SurfaceView.
 - Exact receiver broadcasts permanently supersede traffic-based wake for this receiver. This prevents residual/audio traffic from waking the panel immediately after automatic sleep.
+- Guard persists which receiver packages support exact session broadcasts, and the patched default package `io.github.jqssun.airplay` is treated as exact during migration. Do not make this capability process-local again: on 2026-10-24 Guard restarted, forgot the earlier exact broadcast, treated a 1163 KB/s background download as mirroring, and woke the TV at 09:34.
 - TCP liveness probing remains disabled during an active session because a raw probe looks like a real AirPlay connection and can flush playback.
 - Guard startup, package replacement, and explicit service restart now request an immediate receiver liveness check instead of waiting for the 30-second periodic probe. Checks are coalesced so startup and the periodic loop cannot probe concurrently. This fixes the TV reopening on the Guard screen while the killed receiver remains undiscoverable to the phone.
+
+The persistent exact-session fix was installed as AirPlayGuard 1.0.2 and verified on the target TV. After a package-replacement process restart, Guard logged `wake mode for io.github.jqssun.airplay: exact session broadcasts`. With the panel asleep, a 16 MB ADB transfer at 26.5 MB/s left power state at `Asleep` / display `OFF` and produced no traffic-wake log. A simulated exact session broadcast still woke the panel immediately; the matching session-end broadcast showed the 10-second countdown and returned it to `Asleep` / `OFF`.
 
 ### Reproducible build
 

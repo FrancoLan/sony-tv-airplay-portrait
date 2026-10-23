@@ -84,6 +84,33 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(KEY_ONLY_AFTER_MIRROR, false)
         set(value) = sp.edit().putBoolean(KEY_ONLY_AFTER_MIRROR, value).apply()
 
+    /**
+     * Whether the configured receiver has proved that it sends exact session broadcasts.
+     *
+     * This capability must survive Guard process death and TV reboots. Otherwise the
+     * service falls back to device-wide traffic after every restart and a background
+     * system download can be mistaken for the start of mirroring.
+     *
+     * The receiver shipped by this project is known to support the broadcast, so it is
+     * the migration default for existing installations. Other receiver packages must
+     * prove support by actually sending a session broadcast.
+     */
+    fun receiverUsesExactSessionBroadcast(): Boolean {
+        val knownReceivers = sp.getStringSet(KEY_EXACT_SESSION_RECEIVERS, null)
+            ?: setOf(DEFAULT_RECEIVER)
+        return receiverPackage in knownReceivers
+    }
+
+    fun rememberExactSessionBroadcastReceiver() {
+        val knownReceivers = (
+            sp.getStringSet(KEY_EXACT_SESSION_RECEIVERS, null)
+                ?: setOf(DEFAULT_RECEIVER)
+            ).toMutableSet()
+        if (knownReceivers.add(receiverPackage)) {
+            sp.edit().putStringSet(KEY_EXACT_SESSION_RECEIVERS, knownReceivers).apply()
+        }
+    }
+
     private companion object {
         const val DEFAULT_RECEIVER = "io.github.jqssun.airplay"
         const val KEY_RECEIVER = "receiver_package"
@@ -96,5 +123,6 @@ class Prefs(context: Context) {
         const val KEY_ENABLED = "enabled"
         const val KEY_AUTO_SLEEP = "auto_sleep"
         const val KEY_ONLY_AFTER_MIRROR = "sleep_only_after_mirror"
+        const val KEY_EXACT_SESSION_RECEIVERS = "exact_session_receivers"
     }
 }
